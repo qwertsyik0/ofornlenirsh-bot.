@@ -103,7 +103,8 @@ def init_db() -> None:
               user_id BIGINT PRIMARY KEY,
               style TEXT NOT NULL DEFAULT 'shadow',
               intensity INTEGER NOT NULL DEFAULT 2,
-              decor INTEGER NOT NULL DEFAULT 1
+              decor INTEGER NOT NULL DEFAULT 1,
+              underline INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS drafts(
               user_id BIGINT PRIMARY KEY,
@@ -126,6 +127,10 @@ def init_db() -> None:
             );
             """
         )
+        try:
+            con.execute("ALTER TABLE settings ADD COLUMN underline INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
 
 
 def settings(uid: int) -> dict[str, Any]:
@@ -133,12 +138,12 @@ def settings(uid: int) -> dict[str, Any]:
         row = con.execute("SELECT * FROM settings WHERE user_id=?", (uid,)).fetchone()
         if row is None:
             con.execute("INSERT INTO settings(user_id) VALUES(?)", (uid,))
-            return {"user_id": uid, "style": "shadow", "intensity": 2, "decor": 1}
+            return {"user_id": uid, "style": "shadow", "intensity": 2, "decor": 1, "underline": 0}
         return dict(row)
 
 
 def set_setting(uid: int, key: str, value: Any) -> None:
-    if key not in {"style", "intensity", "decor"}:
+    if key not in {"style", "intensity", "decor", "underline"}:
         return
     settings(uid)
     with connect() as con:
@@ -328,7 +333,7 @@ KEYWORDS = [
 HEADERS = {"dni", "правила", "админы", "admins", "вп", "мп", "faq", "итоги", "итог", "важно", "новости"}
 
 
-def base_format(source: str, style: str, intensity: int, decor_on: bool, seed: int) -> tuple[str, list[Ent], list[int]]:
+def base_format(source: str, style: str, intensity: int, decor_on: bool, underline_on: bool, seed: int) -> tuple[str, list[Ent], list[int]]:
     intensity = max(1, min(3, int(intensity)))
     rows = line_ranges(source)
     nonempty = [(a,b,l) for a,b,l in rows if l.strip()]
@@ -340,7 +345,7 @@ def base_format(source: str, style: str, intensity: int, decor_on: bool, seed: i
         e = b - (len(l) - len(l.rstrip()))
         if e > s and e-s <= 120:
             ents.append(Ent("bold", s, e))
-            if intensity >= 2 and e-s <= 70:
+            if underline_on and intensity >= 3 and e-s <= 45:
                 ents.append(Ent("underline", s, e))
 
     for a,b,l in rows[1:]:
@@ -353,12 +358,20 @@ def base_format(source: str, style: str, intensity: int, decor_on: bool, seed: i
 
     if intensity >= 2:
         low = source.casefold()
-        budget = 2 if intensity == 2 else 4
+        budget = 1 if intensity == 2 else 2
         for kw in KEYWORDS:
             i = low.find(kw)
             if i >= 0 and budget and not overlap(ents, i, i+len(kw)):
-                ents.append(Ent("underline", i, i+len(kw)))
+                ents.append(Ent("bold", i, i+len(kw)))
                 budget -= 1
+
+    if underline_on and intensity >= 3:
+        low = source.casefold()
+        for kw in ("важно", "итоги", "правила"):
+            i = low.find(kw)
+            if i >= 0 and not overlap(ents, i, i+len(kw)):
+                ents.append(Ent("underline", i, i+len(kw)))
+                break
 
     if intensity >= 3:
         used = 0
@@ -427,11 +440,11 @@ def format_post(uid: int, source: str, variant: int = 0, override: int | None = 
     s = settings(uid)
     intensity = int(override or s["intensity"])
     seed = (uid * 1009 + variant * 7919 + sum(map(ord, source[:180]))) & 0x7fffffff
-    text, ents, points = base_format(source, s["style"], intensity, bool(s["decor"]), seed)
+    text, ents, points = base_format(source, s["style"], intensity, bool(s["decor"]), bool(s.get("underline", 0)), seed)
     if custom:
         text, ents = add_custom(text, ents, points, emojis(uid), {1:1,2:2,3:4}[intensity], seed)
     if len(text) > 4096:
-        text, ents, _ = base_format(source, s["style"], intensity, False, seed)
+        text, ents, _ = base_format(source, s["style"], intensity, False, bool(s.get("underline", 0)), seed)
     return text, tg_entities(text, ents)
 
 
@@ -487,6 +500,13 @@ async def command(chat: int, uid: int, mid: int, name: str, arg: str) -> None:
             return
         set_setting(uid,"decor",1 if arg.casefold()=="on" else 0)
         await send(chat, "Готово.", reply_to=mid)
+        return
+    if c == "underline":
+        if arg.casefold() not in {"on","off"}:
+            await send(chat, "Используй /underline on или /underline off", reply_to=mid)
+            return
+        set_setting(uid,"underline",1 if arg.casefold()=="on" else 0)
+        await send(chat, "Подчёркивание включено." if arg.casefold()=="on" else "Подчёркивание выключено.", reply_to=mid)
         return
     await send(chat, "Не знаю такую команду. /help", reply_to=mid)
 
@@ -588,6 +608,7 @@ async def startup() -> None:
             {"command":"style","description":"стиль оформления"},
             {"command":"intensity","description":"насыщенность 1–3"},
             {"command":"decor","description":"декоративные символы"},
+            {"command":"underline","description":"подчёркивание on/off"},
             {"command":"help","description":"помощь"},
         ]})
         if BASE_URL and WEBHOOK_SECRET:
