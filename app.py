@@ -7,6 +7,7 @@ import os
 import random
 import re
 import sqlite3
+import unicodedata
 
 try:
     import psycopg
@@ -104,7 +105,10 @@ def init_db() -> None:
               style TEXT NOT NULL DEFAULT 'shadow',
               intensity INTEGER NOT NULL DEFAULT 2,
               decor INTEGER NOT NULL DEFAULT 1,
-              underline INTEGER NOT NULL DEFAULT 0
+              underline INTEGER NOT NULL DEFAULT 0,
+              fonts INTEGER NOT NULL DEFAULT 1,
+              quotes INTEGER NOT NULL DEFAULT 1,
+              strike INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS drafts(
               user_id BIGINT PRIMARY KEY,
@@ -127,10 +131,20 @@ def init_db() -> None:
             );
             """
         )
-        try:
-            con.execute("ALTER TABLE settings ADD COLUMN underline INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
+        migrations = {
+            "underline": "INTEGER NOT NULL DEFAULT 0",
+            "fonts": "INTEGER NOT NULL DEFAULT 1",
+            "quotes": "INTEGER NOT NULL DEFAULT 1",
+            "strike": "INTEGER NOT NULL DEFAULT 1",
+        }
+        if con.kind == "pg":
+            for col, ddl in migrations.items():
+                con.execute(f"ALTER TABLE settings ADD COLUMN IF NOT EXISTS {col} {ddl}")
+        else:
+            present = {r["name"] for r in con.execute("PRAGMA table_info(settings)").fetchall()}
+            for col, ddl in migrations.items():
+                if col not in present:
+                    con.execute(f"ALTER TABLE settings ADD COLUMN {col} {ddl}")
 
 
 def settings(uid: int) -> dict[str, Any]:
@@ -138,12 +152,12 @@ def settings(uid: int) -> dict[str, Any]:
         row = con.execute("SELECT * FROM settings WHERE user_id=?", (uid,)).fetchone()
         if row is None:
             con.execute("INSERT INTO settings(user_id) VALUES(?)", (uid,))
-            return {"user_id": uid, "style": "shadow", "intensity": 2, "decor": 1, "underline": 0}
+            return {"user_id": uid, "style": "shadow", "intensity": 2, "decor": 1, "underline": 0, "fonts": 1, "quotes": 1, "strike": 1}
         return dict(row)
 
 
 def set_setting(uid: int, key: str, value: Any) -> None:
-    if key not in {"style", "intensity", "decor", "underline"}:
+    if key not in {"style", "intensity", "decor", "underline", "fonts", "quotes", "strike"}:
         return
     settings(uid)
     with connect() as con:
@@ -251,7 +265,9 @@ def pack_rows(uid: int) -> list[sqlite3.Row]:
 def emojis(uid: int) -> list[dict[str, Any]]:
     with connect() as con:
         return [dict(r) for r in con.execute(
-            "SELECT custom_emoji_id,fallback,set_name,pos FROM emojis WHERE user_id=? ORDER BY set_name,pos",
+            "SELECT e.custom_emoji_id,e.fallback,e.set_name,e.pos,p.title "
+            "FROM emojis e LEFT JOIN packs p ON p.user_id=e.user_id AND p.set_name=e.set_name "
+            "WHERE e.user_id=? ORDER BY e.set_name,e.pos",
             (uid,),
         ).fetchall()]
 
@@ -295,14 +311,23 @@ def tg_entities(text: str, ents: list[Ent]) -> list[dict[str, Any]]:
         n += u16(ch)
         pref.append(n)
     out: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
     for e in ents:
         if not (0 <= e.start < e.end <= len(text)):
             continue
-        item: dict[str, Any] = {"type": e.type, "offset": pref[e.start], "length": pref[e.end] - pref[e.start]}
+        item: dict[str, Any] = {
+            "type": e.type,
+            "offset": pref[e.start],
+            "length": pref[e.end] - pref[e.start],
+        }
         if e.extra:
             item.update(e.extra)
+        sig = (item["type"], item["offset"], item["length"], item.get("custom_emoji_id"))
+        if sig in seen:
+            continue
+        seen.add(sig)
         out.append(item)
-    out.sort(key=lambda x: (x["offset"], -x["length"]))
+    out.sort(key=lambda x: (x["offset"], -x["length"], x["type"]))
     return out
 
 
@@ -318,112 +343,378 @@ def line_ranges(text: str) -> list[tuple[int, int, str]]:
     return out
 
 
-def overlap(ents: list[Ent], s: int, e: int) -> bool:
-    return any(max(x.start, s) < min(x.end, e) for x in ents)
+def overlap(ents: list[Ent], s: int, e: int, types: set[str] | None = None) -> bool:
+    for x in ents:
+        if types is not None and x.type not in types:
+            continue
+        if max(x.start, s) < min(x.end, e):
+            return True
+    return False
 
 
 DECOR = {
-    "shadow": ["⌗", "⦿", "𖤐", "⛧", "☾", "⊹", "⋆", "𓆩", "𓆪"],
-    "minimal": ["✦", "⟡", "◌", "⋆"],
+    "shadow": ["⌗", "⦿", "𖤐", "⛧", "☾", "⊹", "⋆", "𓆩", "𓆪", "♱", "◌"],
+    "minimal": ["✦", "⟡", "◌", "⋆", "·"],
 }
-KEYWORDS = [
+
+HEADERS = {
+    "dni", "правила", "админы", "admins", "вп", "мп", "faq", "итоги", "итог",
+    "важно", "новости", "условия", "набор", "розыгрыш", "объявление", "анонс",
+}
+
+SEMANTIC_WORDS: dict[str, tuple[str, ...]] = {
+    "warning": ("важно", "внимание", "осторож", "предупреж", "нельзя", "запрещ", "наруш", "ошиб"),
+    "gift": ("подар", "приз", "розыгрыш", "побед", "награ", "бонус"),
+    "money": ("деньг", "цена", "стоим", "руб", "звезд", "stars", "оплат", "скид", "покуп", "магаз"),
+    "heart": ("люб", "серд", "спасибо", "благодар", "поддерж", "забот", "мил"),
+    "dark": ("тень", "dark", "shadow", "ноч", "чёрн", "черн", "мрак"),
+    "eye": ("смотр", "глаз", "вид", "наблю", "след"),
+    "fire": ("огон", "гор", "жар", "хайп", "жёст", "жест"),
+    "sad": ("груст", "плач", "боль", "жаль", "плохо"),
+    "happy": ("рад", "счаст", "ура", "круто", "поздрав"),
+    "time": ("сегодня", "завтра", "вчера", "срок", "врем", "дата", "день", "час"),
+    "info": ("инфо", "новост", "объяв", "анонс", "сообщ", "подроб"),
+    "question": ("вопрос", "почему", "зачем", "как ", "кто ", "что "),
+    "people": ("админ", "участ", "человек", "команд", "пользоват", "кандидат"),
+    "shop": ("шоп", "shop", "товар", "каталог", "куп", "продаж"),
+    "wallet": ("wallet", "кошел", "баланс", "лапкоин", "лк"),
+    "star": ("звезд", "star", "премиум", "premium"),
+    "secret": ("секрет", "спойлер", "сюрприз", "скоро", "тайн"),
+    "arrow": ("сюда", "ниже", "далее", "ссылка", "переход", "жми", "нажм"),
+}
+
+EMOJI_NAME_HINTS: dict[str, tuple[str, ...]] = {
+    "warning": ("warning", "exclamation", "alert", "prohibited", "cross mark"),
+    "gift": ("gift", "wrapped", "trophy", "medal", "party", "confetti"),
+    "money": ("money", "coin", "dollar", "bank", "credit", "cash"),
+    "heart": ("heart", "love", "kiss"),
+    "dark": ("black", "bat", "vampire", "coffin", "dark"),
+    "eye": ("eye",),
+    "fire": ("fire", "flame"),
+    "sad": ("cry", "sad", "tear", "broken heart"),
+    "happy": ("smil", "grin", "joy", "party"),
+    "time": ("clock", "calendar", "hourglass", "watch"),
+    "info": ("information", "newspaper", "speaker", "megaphone", "bell"),
+    "question": ("question",),
+    "people": ("person", "people", "family", "bust"),
+    "shop": ("shopping", "cart", "bag", "store"),
+    "wallet": ("wallet", "purse"),
+    "star": ("star", "spark", "glow"),
+    "secret": ("shushing", "zipper", "lock", "key"),
+    "arrow": ("arrow", "triangle", "pointer"),
+    "skull": ("skull", "bones"),
+    "moon": ("moon",),
+}
+
+EMPHASIS_PHRASES = (
     "без причины", "отдельно", "раньше времени", "поддержка", "накрутка", "скам",
-    "мёртвые каналы", "мертвые каналы", "актив", "правила", "важно", "приз", "итоги",
-]
-HEADERS = {"dni", "правила", "админы", "admins", "вп", "мп", "faq", "итоги", "итог", "важно", "новости"}
+    "мёртвые каналы", "мертвые каналы", "актив", "правила", "важно", "приз",
+    "итоги", "условия", "скидка", "бонус", "бесплатно", "ограничено",
+)
+
+MONO_UP = {chr(ord("A") + i): chr(0x1D670 + i) for i in range(26)}
+MONO_LOW = {chr(ord("a") + i): chr(0x1D68A + i) for i in range(26)}
+MONO_DIG = {chr(ord("0") + i): chr(0x1D7F6 + i) for i in range(10)}
+MONO_MAP = {**MONO_UP, **MONO_LOW, **MONO_DIG}
 
 
-def base_format(source: str, style: str, intensity: int, decor_on: bool, underline_on: bool, seed: int) -> tuple[str, list[Ent], list[int]]:
+def semantic_tags(text: str) -> set[str]:
+    low = text.casefold()
+    tags: set[str] = set()
+    for tag, words in SEMANTIC_WORDS.items():
+        if any(w in low for w in words):
+            tags.add(tag)
+    if re.search(r"\b\d{1,4}\b", text):
+        tags.add("time" if any(w in low for w in ("день", "час", "минут", "сегодня", "завтра")) else "info")
+    if "!" in text:
+        tags.add("warning")
+    if "?" in text:
+        tags.add("question")
+    return tags
+
+
+def emoji_tags(item: dict[str, Any]) -> set[str]:
+    fb = str(item.get("fallback") or "")
+    pack = f"{item.get('set_name') or ''} {item.get('title') or ''}".casefold()
+    names = " ".join(unicodedata.name(ch, "") for ch in fb).casefold()
+    raw = f"{fb} {pack} {names}"
+    tags: set[str] = set()
+    for tag, hints in EMOJI_NAME_HINTS.items():
+        if any(h in raw for h in hints):
+            tags.add(tag)
+    if any(ch in fb for ch in "❤️🩷🖤🤍💜💙💚💛🧡💘💝💖💕💞"):
+        tags.add("heart")
+    if any(ch in fb for ch in "✨⭐🌟💫✦✧⋆"):
+        tags.add("star")
+    if any(ch in fb for ch in "🎁🏆🥇🥈🥉🎉"):
+        tags.add("gift")
+    if any(ch in fb for ch in "💰💸💳🪙💵"):
+        tags.add("money")
+    if any(ch in fb for ch in "👁👀"):
+        tags.add("eye")
+    if any(ch in fb for ch in "🔥"):
+        tags.add("fire")
+    if any(ch in fb for ch in "🌙🌚🌑"):
+        tags.add("moon")
+        tags.add("dark")
+    if any(ch in fb for ch in "☠💀🦇⚰"):
+        tags.add("dark")
+        tags.add("skull")
+    if any(ch in fb for ch in "⚠❗‼⛔"):
+        tags.add("warning")
+    if len(fb.strip()) == 1 and fb.strip().isalnum():
+        tags.add("letter")
+    if "letter" in pack or "alphabet" in pack or "букв" in pack:
+        tags.add("letter")
+    if any(x in pack for x in ("dark", "shadow", "black", "goth", "emo")):
+        tags.add("dark")
+    if any(x in pack for x in ("pink", "love", "heart", "cute", "nyan")):
+        tags.add("heart")
+    return tags
+
+
+def apply_text_font(text: str, start: int, end: int, intensity: int, seed: int) -> str:
+    if intensity < 2 or start >= end:
+        return text
+    segment = text[start:end]
+    words = list(re.finditer(r"[A-Za-z0-9]{3,24}", segment))
+    if not words:
+        return text
+    rng = random.Random(seed ^ 0xA53C)
+    chosen = words[0] if intensity == 2 else rng.choice(words[: min(3, len(words))])
+    a, b = start + chosen.start(), start + chosen.end()
+    styled = "".join(MONO_MAP.get(ch, ch) for ch in text[a:b])
+    # Every ASCII character maps to exactly one Unicode code point, so Python indexes stay stable.
+    return text[:a] + styled + text[b:]
+
+
+def best_quote(rows: list[tuple[int, int, str]], ents: list[Ent], intensity: int, seed: int) -> tuple[int, int] | None:
+    if intensity < 2 or len(rows) < 3:
+        return None
+    ranked: list[tuple[int, int, int]] = []
+    for idx, (a, b, line) in enumerate(rows[1:], 1):
+        clean = line.strip()
+        if not (18 <= len(clean) <= 220):
+            continue
+        if re.match(r"^[•·\-–—#]", clean):
+            continue
+        score = 0
+        low = clean.casefold()
+        if any(w in low for w in ("важно", "главное", "помни", "услов", "итог", "если ", "почему", "обратите", "учти")):
+            score += 4
+        if clean.endswith((".", "!", "?")):
+            score += 1
+        if idx >= len(rows) - 2:
+            score += 1
+        if not overlap(ents, a, b, {"code", "pre"}):
+            ranked.append((score, a, b))
+    if not ranked:
+        return None
+    ranked.sort(reverse=True)
+    score, a, b = ranked[0]
+    rng = random.Random(seed ^ 0xB10C)
+    threshold = 3 if intensity == 2 else 1
+    if score >= threshold or (intensity == 3 and rng.random() < 0.45):
+        line = next((l for x, y, l in rows if x == a and y == b), "")
+        left = len(line) - len(line.lstrip())
+        right = len(line.rstrip())
+        return a + left, a + right
+    return None
+
+
+def context_at(text: str, p: int) -> str:
+    a = text.rfind("\n", 0, max(0, p)) + 1
+    b = text.find("\n", p)
+    if b < 0:
+        b = len(text)
+    return text[a:b]
+
+
+def choose_custom_emoji(pool: list[dict[str, Any]], wanted: set[str], style: str,
+                        used: set[str], rng: random.Random) -> dict[str, Any] | None:
+    candidates = [x for x in pool if str(x.get("custom_emoji_id")) not in used]
+    if not candidates:
+        return None
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for item in candidates:
+        tags = emoji_tags(item)
+        score = 0.0
+        score += 5.0 * len(tags & wanted)
+        if style == "shadow" and tags & {"dark", "eye", "moon", "skull"}:
+            score += 2.2
+        if style == "minimal" and tags & {"star", "info", "arrow"}:
+            score += 1.5
+        if "letter" in tags:
+            score -= 3.5
+        if not tags:
+            score -= 0.5
+        score += rng.random() * 0.8
+        scored.append((score, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if scored[0][0] < 0.2:
+        nonletters = [x for x in candidates if "letter" not in emoji_tags(x)]
+        return rng.choice(nonletters or candidates)
+    return scored[0][1]
+
+
+def base_format(source: str, style: str, intensity: int, decor_on: bool,
+                underline_on: bool, fonts_on: bool, quotes_on: bool,
+                strike_on: bool, seed: int) -> tuple[str, list[Ent], list[int]]:
     intensity = max(1, min(3, int(intensity)))
+    rng = random.Random(seed)
     rows = line_ranges(source)
-    nonempty = [(a,b,l) for a,b,l in rows if l.strip()]
+    nonempty = [(a, b, l) for a, b, l in rows if l.strip()]
     ents: list[Ent] = []
+    title_span: tuple[int, int] | None = None
+    text = source
 
+    # Title: bold, optionally a real Unicode text font on Latin/digits.
     if nonempty:
-        a,b,l = nonempty[0]
-        s = a + len(l) - len(l.lstrip())
-        e = b - (len(l) - len(l.rstrip()))
-        if e > s and e-s <= 120:
-            ents.append(Ent("bold", s, e))
-            if underline_on and intensity >= 3 and e-s <= 45:
-                ents.append(Ent("underline", s, e))
+        a, b, line = nonempty[0]
+        ts = a + len(line) - len(line.lstrip())
+        te = b - (len(line) - len(line.rstrip()))
+        if te > ts and te - ts <= 120:
+            title_span = (ts, te)
+            if fonts_on:
+                text = apply_text_font(text, ts, te, intensity, seed)
+            ents.append(Ent("bold", ts, te))
 
-    for a,b,l in rows[1:]:
-        clean = re.sub(r"^[\s#•·.\-–—]+", "", l).strip()
+    # Secondary headings.
+    for a, b, line in rows[1:]:
+        clean = re.sub(r"^[\s#•·.\-–—]+", "", line).strip()
         normalized = re.sub(r"[^\wА-Яа-яЁё]+", "", clean).casefold()
         if clean and len(clean) <= 50 and (normalized in HEADERS or (clean.isupper() and len(clean) <= 28)):
-            s = a + l.find(clean)
-            if not overlap(ents, s, s+len(clean)):
-                ents.append(Ent("bold", s, s+len(clean)))
+            p = a + line.find(clean)
+            if not overlap(ents, p, p + len(clean), {"code", "pre"}):
+                ents.append(Ent("bold", p, p + len(clean)))
 
+    # Semantic emphasis. Important phrases are bold, but not every post gets the same treatment.
     if intensity >= 2:
         low = source.casefold()
+        candidates: list[tuple[int, int]] = []
+        for phrase in EMPHASIS_PHRASES:
+            for m in re.finditer(re.escape(phrase), low):
+                candidates.append((m.start(), m.end()))
+        candidates.sort()
         budget = 1 if intensity == 2 else 2
-        for kw in KEYWORDS:
-            i = low.find(kw)
-            if i >= 0 and budget and not overlap(ents, i, i+len(kw)):
-                ents.append(Ent("bold", i, i+len(kw)))
+        rng.shuffle(candidates)
+        for a, b in candidates:
+            if budget <= 0:
+                break
+            if not overlap(ents, a, b, {"code", "pre"}):
+                ents.append(Ent("bold", a, b))
                 budget -= 1
 
+    # Italics only when a line reads like explanatory/descriptive copy.
+    if intensity >= 2:
+        scored: list[tuple[int, int, int]] = []
+        for a, b, line in nonempty[1:]:
+            clean = line.strip()
+            if not (12 <= len(clean) <= 180) or re.match(r"^[•·\-–—#]", clean):
+                continue
+            tags = semantic_tags(clean)
+            score = (2 if tags & {"heart", "sad", "happy", "secret", "info"} else 0) + (1 if clean.endswith(".") else 0)
+            scored.append((score, a + len(line) - len(line.lstrip()), a + len(line.rstrip())))
+        if scored:
+            scored.sort(reverse=True)
+            _, a, b = scored[0]
+            if not overlap(ents, a, b, {"code", "pre", "blockquote"}):
+                ents.append(Ent("italic", a, b))
+
+    # A quote is selected from a meaningful standalone line, not blindly on every message.
+    if quotes_on:
+        q = best_quote(rows, ents, intensity, seed)
+        if q:
+            ents.append(Ent("blockquote", q[0], q[1]))
+
+    # Sparse aesthetic strike-through: one letter in the title, never a whole meaningful word.
+    if strike_on and intensity >= 2 and title_span:
+        a, b = title_span
+        letters = [i for i in range(a + 1, max(a + 1, b - 1)) if text[i].isalnum()]
+        chance = 0.45 if intensity == 2 else 0.8
+        if letters and rng.random() < chance:
+            i = rng.choice(letters)
+            ents.append(Ent("strikethrough", i, i + 1))
+
+    # Underline remains opt-in and rare.
     if underline_on and intensity >= 3:
         low = source.casefold()
-        for kw in ("важно", "итоги", "правила"):
+        for kw in ("важно", "итоги", "правила", "условия"):
             i = low.find(kw)
-            if i >= 0 and not overlap(ents, i, i+len(kw)):
-                ents.append(Ent("underline", i, i+len(kw)))
+            if i >= 0:
+                ents.append(Ent("underline", i, i + len(kw)))
                 break
 
+    # Spoiler only where the wording itself implies a spoiler/secret.
     if intensity >= 3:
-        used = 0
-        for a,b,l in nonempty[1:]:
-            c = l.strip()
-            if 8 <= len(c) <= 80:
-                s = a + l.find(c)
-                if not overlap(ents, s, s+len(c)):
-                    ents.append(Ent("italic", s, s+len(c)))
-                    used += 1
-                    if used == 2:
-                        break
+        low = source.casefold()
+        for kw in ("спойлер", "секрет", "сюрприз", "скоро"):
+            i = low.find(kw)
+            if i >= 0 and not overlap(ents, i, i + len(kw), {"code", "pre"}):
+                ents.append(Ent("spoiler", i, i + len(kw)))
+                break
 
+    # Telegram monospace for explicitly technical tokens. This is another text font, not a design image.
+    for m in re.finditer(r"(?<!\w)(@[A-Za-z0-9_]{4,32}|/[A-Za-z0-9_]{2,32})(?!\w)", text):
+        if not overlap(ents, m.start(), m.end(), {"code", "pre"}):
+            ents.append(Ent("code", m.start(), m.end()))
+
+    # Decorative prefix is allowed, but wording remains untouched.
     prefix = ""
-    if decor_on and source.strip() and style != "minimal":
-        rng = random.Random(seed)
+    if decor_on and source.strip():
         chars = DECOR.get(style, DECOR["shadow"])
-        prefix = (rng.choice(chars) + "  ") if intensity == 1 else (
-            rng.choice(chars) + " " + rng.choice(chars) + "  " if intensity == 2 else
-            rng.choice(chars) + " " + rng.choice(chars) + " .. "
-        )
-    elif decor_on and source.strip() and intensity >= 2:
-        rng = random.Random(seed)
-        prefix = rng.choice(DECOR["minimal"]) + "  "
+        if style == "minimal":
+            if intensity >= 2:
+                prefix = rng.choice(chars) + "  "
+        else:
+            if intensity == 1:
+                prefix = rng.choice(chars) + "  "
+            elif intensity == 2:
+                prefix = rng.choice(chars) + " " + rng.choice(chars) + "  "
+            else:
+                prefix = rng.choice(chars) + " " + rng.choice(chars) + " .. "
 
-    shifted = [Ent(e.type, e.start+len(prefix), e.end+len(prefix), e.extra) for e in ents]
-    text = prefix + source
+    shifted = [Ent(e.type, e.start + len(prefix), e.end + len(prefix), e.extra) for e in ents]
+    text = prefix + text
+
+    # Candidate emoji insertion points. The actual emoji is selected semantically later.
     points: list[int] = []
     if source.strip():
         points.append(len(prefix) + len(source) - len(source.lstrip()))
         if intensity >= 2:
-            for a,_,l in nonempty[1:]:
-                points.append(len(prefix) + a + len(l) - len(l.lstrip()))
+            for a, _, line in nonempty[1:]:
+                clean = line.strip()
+                if not clean:
+                    continue
+                points.append(len(prefix) + a + len(line) - len(line.lstrip()))
                 if len(points) >= (2 if intensity == 2 else 4):
                     break
     return text, shifted, points
 
 
-def add_custom(text: str, ents: list[Ent], points: list[int], pool: list[dict[str, Any]], count: int, seed: int) -> tuple[str, list[Ent]]:
+def add_custom(text: str, ents: list[Ent], points: list[int], pool: list[dict[str, Any]],
+               count: int, seed: int, style: str) -> tuple[str, list[Ent]]:
     if not pool or not points or count <= 0:
         return text, ents
     rng = random.Random(seed ^ 0x5F3759DF)
-    sample = pool[:]
-    rng.shuffle(sample)
-    chosen = sample[:min(count, len(points), len(sample))]
-    ops: list[tuple[int,str,str]] = []
-    for p,item in zip(points, chosen):
+    global_tags = semantic_tags(text)
+    used: set[str] = set()
+    ops: list[tuple[int, str, str]] = []
+
+    for p in points[:count]:
+        local = context_at(text, p)
+        wanted = semantic_tags(local) | global_tags
+        item = choose_custom_emoji(pool, wanted, style, used, rng)
+        if not item:
+            continue
+        cid = str(item["custom_emoji_id"])
+        used.add(cid)
         fb = (item.get("fallback") or "✨").strip() or "✨"
-        if len(fb) > 8:
+        if len(fb) > 8 or (len(fb) == 1 and fb.isalnum()):
             fb = "✨"
-        ops.append((p, fb + " ", str(item["custom_emoji_id"])))
-    for p,ins,cid in sorted(ops, reverse=True):
+        ops.append((p, fb + " ", cid))
+
+    for p, ins, cid in sorted(ops, reverse=True):
         delta = len(ins)
         for e in ents:
             if e.start >= p:
@@ -432,19 +723,35 @@ def add_custom(text: str, ents: list[Ent], points: list[int], pool: list[dict[st
             elif e.end > p:
                 e.end += delta
         text = text[:p] + ins + text[p:]
-        ents.append(Ent("custom_emoji", p, p+len(ins.rstrip()), {"custom_emoji_id": cid}))
+        ents.append(Ent("custom_emoji", p, p + len(ins.rstrip()), {"custom_emoji_id": cid}))
     return text, ents
 
 
-def format_post(uid: int, source: str, variant: int = 0, override: int | None = None, custom: bool = True) -> tuple[str, list[dict[str, Any]]]:
+def format_post(uid: int, source: str, variant: int = 0, override: int | None = None,
+                custom: bool = True) -> tuple[str, list[dict[str, Any]]]:
     s = settings(uid)
     intensity = int(override or s["intensity"])
-    seed = (uid * 1009 + variant * 7919 + sum(map(ord, source[:180]))) & 0x7fffffff
-    text, ents, points = base_format(source, s["style"], intensity, bool(s["decor"]), bool(s.get("underline", 0)), seed)
+    seed = (uid * 1009 + variant * 7919 + sum(map(ord, source[:240]))) & 0x7FFFFFFF
+    text, ents, points = base_format(
+        source,
+        s["style"],
+        intensity,
+        bool(s["decor"]),
+        bool(s.get("underline", 0)),
+        bool(s.get("fonts", 1)),
+        bool(s.get("quotes", 1)),
+        bool(s.get("strike", 1)),
+        seed,
+    )
     if custom:
-        text, ents = add_custom(text, ents, points, emojis(uid), {1:1,2:2,3:4}[intensity], seed)
+        text, ents = add_custom(
+            text, ents, points, emojis(uid), {1: 1, 2: 2, 3: 4}[intensity], seed, s["style"]
+        )
     if len(text) > 4096:
-        text, ents, _ = base_format(source, s["style"], intensity, False, bool(s.get("underline", 0)), seed)
+        text, ents, _ = base_format(
+            source, s["style"], intensity, False, bool(s.get("underline", 0)),
+            bool(s.get("fonts", 1)), bool(s.get("quotes", 1)), bool(s.get("strike", 1)), seed
+        )
     return text, tg_entities(text, ents)
 
 
@@ -456,10 +763,12 @@ KB = {"inline_keyboard": [
 ]}
 
 START = (
-    "Пришли готовый текст поста. Я не переписываю слова, не исправляю формулировки и не добавляю новые фразы. "
-    "Только оформляю: жирный, курсив, подчёркивание, декоративные символы и premium/custom emoji из твоих паков.\n\n"
-    "Чтобы добавить emoji pack, просто пришли ссылку t.me/addemoji/...\n\n"
-    "/packs — мои паки\n/delpack <номер> — удалить пак\n/style shadow|minimal\n/intensity 1|2|3\n/decor on|off"
+    "Пришли готовый текст поста. Слова и смысл не переписываю. Я анализирую структуру и смысл, "
+    "а затем оформляю: жирный, курсив, редкое подчёркивание, зачёркивание отдельных букв, цитаты, "
+    "спойлеры, Telegram monospace, Unicode-шрифт для подходящих латинских фрагментов и premium/custom emoji из твоих паков.\n\n"
+    "Emoji pack: просто пришли ссылку t.me/addemoji/... Я просканирую его и буду подбирать emoji по смыслу текста.\n\n"
+    "/packs — мои паки\n/delpack <номер> — удалить пак\n/style shadow|minimal\n/intensity 1|2|3\n"
+    "/decor on|off\n/fonts on|off\n/quotes on|off\n/strike on|off\n/underline on|off"
 )
 
 
@@ -507,6 +816,14 @@ async def command(chat: int, uid: int, mid: int, name: str, arg: str) -> None:
             return
         set_setting(uid,"underline",1 if arg.casefold()=="on" else 0)
         await send(chat, "Подчёркивание включено." if arg.casefold()=="on" else "Подчёркивание выключено.", reply_to=mid)
+        return
+    if c in {"fonts", "quotes", "strike"}:
+        if arg.casefold() not in {"on","off"}:
+            await send(chat, f"Используй /{c} on или /{c} off", reply_to=mid)
+            return
+        set_setting(uid, c, 1 if arg.casefold()=="on" else 0)
+        names = {"fonts": "Текстовые шрифты", "quotes": "Цитаты", "strike": "Зачёркивание"}
+        await send(chat, f"{names[c]}: {'включено' if arg.casefold()=='on' else 'выключено'}.", reply_to=mid)
         return
     await send(chat, "Не знаю такую команду. /help", reply_to=mid)
 
@@ -609,6 +926,9 @@ async def startup() -> None:
             {"command":"intensity","description":"насыщенность 1–3"},
             {"command":"decor","description":"декоративные символы"},
             {"command":"underline","description":"подчёркивание on/off"},
+            {"command":"fonts","description":"текстовые Unicode-шрифты"},
+            {"command":"quotes","description":"умные цитаты on/off"},
+            {"command":"strike","description":"зачёркивание букв on/off"},
             {"command":"help","description":"помощь"},
         ]})
         if BASE_URL and WEBHOOK_SECRET:
