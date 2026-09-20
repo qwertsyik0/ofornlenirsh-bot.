@@ -7,6 +7,14 @@ import os
 import random
 import re
 import sqlite3
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # local SQLite fallback
+    psycopg = None
+    dict_row = None
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +29,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or (
     hashlib.sha256((BOT_TOKEN + ":ofornlenirsh").encode()).hexdigest()[:40] if BOT_TOKEN else ""
 )
 DB_PATH = Path(os.getenv("DB_PATH", "/tmp/ofornlenirsh.sqlite3"))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MAX_TEXT = 3900
 
@@ -35,11 +44,52 @@ CMD_RE = re.compile(r"^/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+(.*))?$", re.S)
 
 # ---------- persistence ----------
 
-def connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+class DBConn:
+    def __init__(self) -> None:
+        if DATABASE_URL:
+            if psycopg is None:
+                raise RuntimeError("DATABASE_URL is set but psycopg is not installed")
+            self.kind = "pg"
+            self.raw = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        else:
+            self.kind = "sqlite"
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self.raw = sqlite3.connect(DB_PATH)
+            self.raw.row_factory = sqlite3.Row
+
+    def _sql(self, sql: str) -> str:
+        return sql.replace("?", "%s") if self.kind == "pg" else sql
+
+    def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()):
+        return self.raw.execute(self._sql(sql), params)
+
+    def executemany(self, sql: str, params):
+        return self.raw.executemany(self._sql(sql), params)
+
+    def executescript(self, script: str) -> None:
+        if self.kind == "sqlite":
+            self.raw.executescript(script)
+            return
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if statement:
+                self.raw.execute(statement)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.raw.commit()
+            else:
+                self.raw.rollback()
+        finally:
+            self.raw.close()
+
+
+def connect() -> DBConn:
+    return DBConn()
 
 
 def init_db() -> None:
@@ -47,24 +97,24 @@ def init_db() -> None:
         con.executescript(
             """
             CREATE TABLE IF NOT EXISTS settings(
-              user_id INTEGER PRIMARY KEY,
+              user_id BIGINT PRIMARY KEY,
               style TEXT NOT NULL DEFAULT 'shadow',
               intensity INTEGER NOT NULL DEFAULT 2,
               decor INTEGER NOT NULL DEFAULT 1
             );
             CREATE TABLE IF NOT EXISTS drafts(
-              user_id INTEGER PRIMARY KEY,
+              user_id BIGINT PRIMARY KEY,
               text TEXT NOT NULL,
               variant INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS packs(
-              user_id INTEGER NOT NULL,
+              user_id BIGINT NOT NULL,
               set_name TEXT NOT NULL,
               title TEXT NOT NULL,
               PRIMARY KEY(user_id, set_name)
             );
             CREATE TABLE IF NOT EXISTS emojis(
-              user_id INTEGER NOT NULL,
+              user_id BIGINT NOT NULL,
               set_name TEXT NOT NULL,
               pos INTEGER NOT NULL,
               custom_emoji_id TEXT NOT NULL,
