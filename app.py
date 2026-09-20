@@ -64,6 +64,9 @@ class DBConn:
         return self.raw.execute(self._sql(sql), params)
 
     def executemany(self, sql: str, params):
+        if self.kind == "pg":
+            with self.raw.cursor() as cur:
+                return cur.executemany(self._sql(sql), params)
         return self.raw.executemany(self._sql(sql), params)
 
     def executescript(self, script: str) -> None:
@@ -499,7 +502,7 @@ async def on_message(m: dict[str, Any]) -> None:
     if cm:
         await command(chat,uid,mid,cm.group(1),cm.group(2) or "")
         return
-    if PACK_RE.fullmatch(text.strip()):
+    if PACK_RE.search(text.strip()):
         _, msg = await import_pack(uid,text)
         await send(chat,msg,reply_to=mid)
         return
